@@ -416,23 +416,23 @@ class PointerGRUCell(tf.contrib.rnn.RNNCell):
         N = self.N
         with tf.variable_scope(scope or type(self).__name__):
             with tf.variable_scope("preRNN"):
-                W_h_p = tf.get_variable("W_h_p",shape = [d,d], initializer = self.initializer)
-                W_h_a = tf.get_variable("W_h_a",shape = [d,d], initializer = self.initializer)
-                v = tf.get_variable("v", shape = [d,1], initializer = self.initializer)
+                W_h_p = tf.get_variable("W_h_p",shape = [d,d])
+                W_h_a = tf.get_variable("W_h_a",shape = [d,d])
+                v = tf.get_variable("v", shape = [d,1])
                 a1 = tf.matmul(inputs,W_h_p)
                 a2 = tf.matmul(state,W_h_a)
                 a2 = tf.reshape(tf.tile(tf.reshape(a2,[-1,1,d]),[1,N,d]),[-1,d])
                 a = tf.tanh(a1+a2)
                 s = tf.matmul(a,v)
-                s = t.reshape(s,[-1,self.N])
-                _,alpha = masked_softmax(s,self.mask)
+                s = tf.reshape(s,[-1,self.N])
+                _,alpha = masked_softmax(s,self.mask,1)
                 c = tf.matmul(alpha,s)
 
             with tf.variable_scope("Gates"):
                 ru = tf.contrib.layers.fully_connected(c,2*self._num_units) + tf.contrib.layers.fully_connected(state,2*self._num_units)
                 ru = tf.nn.sigmoid(ru)
                 r,u = tf.split(ru,2,1)
-                o = tf.tanh(tf.contrib.layers.fully_connected(r*state,self._num_units) + tf.conrib.layers.fully_connected(c,self._num_units))
+                o = tf.tanh(tf.contrib.layers.fully_connected(r*state,self._num_units) + tf.contrib.layers.fully_connected(c,self._num_units))
 
             new_state = u*state + (1-u)*o
             return s,new_state
@@ -475,10 +475,11 @@ class PointerNetwork():
             h_prev = r
             '''
             bs,N,d = attn_contexts.get_shape().as_list()
-            attn_contexts_flat = tf.reshape(attn_contexts,[-1,d])
+            attn_contexts_flat = tf.reshape(attn_contexts,[-1,1,d])
+            inputs = tf.concat([attn_contexts_flat,attn_contexts_flat],axis = 1)
+            print(inputs.shape)
             ptr_cell = PointerGRUCell(d,N,context_mask)
-            init_state = ptr_cell.zero_state(bs,tf.float32)
-            logits,_ = tf.nn.dynamic_rnn(ptr_cell,attn_contexts_flat,initial_state = init_state)
+            logits,_ = tf.nn.dynamic_rnn(ptr_cell,inputs,dtype = tf.float32)
             return logits
 
 

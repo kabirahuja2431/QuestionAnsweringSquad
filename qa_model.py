@@ -559,8 +559,8 @@ class QAModelPtr(QAModel):
 		self.logits_start = tf.squeeze(self.logits_start,axis = 1)
 		self.logits_end = tf.squeeze(self.logits_end,axis = 1)
 
-		self.logits_start, self.probdist_start = masked_softmax(self.logits_start,1)
-		self.logits_end,self.probdist_end = masked_softmax(self.logits_end,1)		
+		self.logits_start, self.probdist_start = masked_softmax(self.logits_start,self.context_mask,1)
+		self.logits_end,self.probdist_end = masked_softmax(self.logits_end,self.context_mask,1)		
 
 class QAModelCharCNN(QAModel):
 	def __init__(self, FLAGS, id2word, word2id,char2id,id2char, emb_matrix):	
