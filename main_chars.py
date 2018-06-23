@@ -25,8 +25,7 @@ import logging
 
 import tensorflow as tf
 
-from qa_model import QAModel
-from qa_model import QAModelCharCNN
+from qa_model import QAModel, QAModelCharCNN, RNet, RNetTrans
 from qa_BiDAF_model import QAModel_BIDAF
 from qa_model_rnet import RnetBasic
 from vocab import get_glove
@@ -51,9 +50,9 @@ tf.app.flags.DEFINE_integer("num_epochs", 0, "Number of epochs to train. 0 means
 tf.app.flags.DEFINE_float("learning_rate", 0.001, "Learning rate.")
 tf.app.flags.DEFINE_float("max_gradient_norm", 5.0, "Clip gradients to this norm.")
 tf.app.flags.DEFINE_float("dropout", 0.15, "Fraction of units randomly dropped on non-recurrent connections.")
-tf.app.flags.DEFINE_integer("batch_size", 100, "Batch size to use")
-tf.app.flags.DEFINE_integer("hidden_size", 200, "Size of the hidden states")
-tf.app.flags.DEFINE_integer("context_len", 600, "The maximum context length of your model")
+tf.app.flags.DEFINE_integer("batch_size", 16, "Batch size to use")
+tf.app.flags.DEFINE_integer("hidden_size", 100, "Size of the hidden states")
+tf.app.flags.DEFINE_integer("context_len", 300, "The maximum context length of your model")
 tf.app.flags.DEFINE_integer("question_len", 30, "The maximum question length of your model")
 tf.app.flags.DEFINE_integer("char_len",10,"The maximum length of characters in a word")
 tf.app.flags.DEFINE_integer("embedding_size", 100, "Size of the pretrained word vectors. This needs to be one of the available GloVe dimensions: 50/100/200/300")
@@ -64,8 +63,8 @@ tf.app.flags.DEFINE_integer("kernel_size",5,"Number of kernels to use in convolu
 
 # How often to print, save, eval
 tf.app.flags.DEFINE_integer("print_every", 1, "How many iterations to do per print.")
-tf.app.flags.DEFINE_integer("save_every", 500, "How many iterations to do per save.")
-tf.app.flags.DEFINE_integer("eval_every", 500, "How many iterations to do per calculating loss/f1/em on dev set. Warning: this is fairly time-consuming so don't do it too often.")
+tf.app.flags.DEFINE_integer("save_every", 1000, "How many iterations to do per save.")
+tf.app.flags.DEFINE_integer("eval_every", 1000, "How many iterations to do per calculating loss/f1/em on dev set. Warning: this is fairly time-consuming so don't do it too often.")
 tf.app.flags.DEFINE_integer("keep", 1, "How many checkpoints to keep. 0 indicates keep all (you shouldn't need to do keep all though - it's very storage intensive).")
 
 # Reading and saving data
@@ -143,7 +142,7 @@ def main(unused_argv):
 	dev_ans_path = os.path.join(FLAGS.data_dir, "dev.span")
 
 	# Initialize model
-	qa_model = QAModelCharCNN(FLAGS, id2word, word2id, char2id,id2char, emb_matrix)
+	qa_model = RNetTrans(FLAGS, id2word, word2id, char2id,id2char, emb_matrix)
 
 	# Some GPU settings
 	config=tf.ConfigProto()
@@ -182,7 +181,7 @@ def main(unused_argv):
 			initialize_model(sess, qa_model, bestmodel_dir, expect_exists=True)
 
 			# Show examples with F1/EM scores
-			_, _ = qa_model.check_f1_em(sess, dev_context_path, dev_qn_path, dev_ans_path, "dev", num_samples=10, print_to_screen=True)
+			_, _ = qa_model.check_f1_em(sess, dev_context_path, dev_qn_path, dev_ans_path, "dev", num_samples=20, print_to_screen=True)
 
 
 	elif FLAGS.mode == "official_eval":

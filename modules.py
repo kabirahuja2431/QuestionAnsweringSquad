@@ -197,12 +197,24 @@ class SimpleSoftmaxLayer(object):
 
             # Linear downprojection layer
             logits = tf.contrib.layers.fully_connected(inputs, num_outputs=1, activation_fn=None) # shape (batch_size, seq_len, 1)
+            print logits.shape
             logits = tf.squeeze(logits, axis=[2]) # shape (batch_size, seq_len)
 
             # Take softmax over sequence
             masked_logits, prob_dist = masked_softmax(logits, masks, 1)
 
             return masked_logits, prob_dist
+
+#Without mask softmax
+class SoftmaxLayer(object):
+    def __init__(self):
+        pass
+    def build_graph(self,inputs):
+        with vs.variable_scope("SoftmaxLayer"):
+            logits = tf.contrib.layers.fully_connected(inputs, num_outputs = 1, activation_fn = None)
+            logits = tf.squeeze(logits, axis = 2)
+            prob_dist = tf.nn.softmax(logits, dim = 1)
+            return logits, prob_dist
 
 
 class BasicAttn(object):
@@ -264,6 +276,27 @@ class BasicAttn(object):
             output = tf.nn.dropout(output, self.keep_prob)
 
             return attn_dist, output
+
+class ScaledDotAttention(BasicAttn):
+    def __init__(self, keep_prob, key_vec_size, value_vec_size,scope = "ScaledDotAttention"):
+        BasicAttn.__init__(self,keep_prob,key_vec_size,value_vec_size)
+        self.scope = scope
+
+    def build_graph(self, values, values_mask, keys):
+        with vs.variable_scope(self.scope):
+            values_ = tf.contrib.layers.fully_connected(values,num_outputs = self.value_vec_size)
+            keys_ = tf.contrib.layers.fully_connected(keys, num_outputs = self.key_vec_size)
+            attn_logits = tf.matmul(keys_,tf.transpose(values_, perm = [0,2,1]))/(self.key_vec_size**0.5)
+            attn_logits_mask = tf.expand_dims(values_mask,1)
+            _, attn_dist = masked_softmax(attn_logits,attn_logits_mask,2)
+
+            output = tf.matmul(attn_dist, values)
+            output = tf.nn.dropout(output, self.keep_prob)
+            blended_reps = tf.concat([keys,output], axis = 2)
+
+            gate = tf.contrib.layers.fully_connected(blended_reps, num_outputs = self.value_vec_size + self.key_vec_size, activation_fn = tf.nn.sigmoid)
+            return blended_reps*gate
+
 
 class BiDAF():
     def __init__(self,keep_prob,h):
@@ -390,99 +423,55 @@ class SelfAttn():
         print(E.shape)
 
         #Applying softmax on E
-        _,alpha = masked_softmax(E,values_mask,2)
+        '''
+        mask1 = tf.tile(tf.reshape(values_mask,[-1,N,1]),[1,1,N])
+        mask2 = tf.tile(tf.reshape(values_mask,[-1,1,N]),[1,N,1])
+        mask = mask1*mask2
+        '''
+        mask = tf.matmul(tf.reshape(values_mask,[-1,N,1]),tf.reshape(values_mask,[-1,1,N]))
+        _,alpha = masked_softmax(E,mask,2)
         print(alpha.shape)
         #Taking the weighted sum over all the context vectors
         A = tf.matmul(alpha,values)
 
         return A
 
-class PointerGRUCell(tf.contrib.rnn.RNNCell):
-    def __init__(self,num_units,N, mask):
-        self._num_units = num_units
-        self.N = N
-        self.mask = mask
-
-    @property
-    def state_size(self):
-        return self._num_units
-
-    @property
-    def output_size(self):
-        return self.N
-
-    def __call__(self, inputs, state, scope = None):
-        _,d = inputs.get_shape().as_list()
-        N = self.N
-        with tf.variable_scope(scope or type(self).__name__):
-            with tf.variable_scope("preRNN"):
-                W_h_p = tf.get_variable("W_h_p",shape = [d,d])
-                W_h_a = tf.get_variable("W_h_a",shape = [d,d])
-                v = tf.get_variable("v", shape = [d,1])
-                a1 = tf.matmul(inputs,W_h_p)
-                a2 = tf.matmul(state,W_h_a)
-                a2 = tf.reshape(tf.tile(tf.reshape(a2,[-1,1,d]),[1,N,d]),[-1,d])
-                a = tf.tanh(a1+a2)
-                s = tf.matmul(a,v)
-                s = tf.reshape(s,[-1,self.N])
-                _,alpha = masked_softmax(s,self.mask,1)
-                c = tf.matmul(alpha,s)
-
-            with tf.variable_scope("Gates"):
-                ru = tf.contrib.layers.fully_connected(c,2*self._num_units) + tf.contrib.layers.fully_connected(state,2*self._num_units)
-                ru = tf.nn.sigmoid(ru)
-                r,u = tf.split(ru,2,1)
-                o = tf.tanh(tf.contrib.layers.fully_connected(r*state,self._num_units) + tf.contrib.layers.fully_connected(c,self._num_units))
-
-            new_state = u*state + (1-u)*o
-            return s,new_state
+def get_initial_state(inputs, mask, hidden_size,mf = 4):
+    out1 = tf.contrib.layers.fully_connected(inputs,hidden_size,activation_fn = None)
+    out1 = tf.tanh(out1)
+    out2 = tf.contrib.layers.fully_connected(out1,1,activation_fn = None)
+    logits, dist = masked_softmax(tf.squeeze(out2,axis = 2),mask,1)
+    c = tf.matmul(tf.expand_dims(dist,axis = 1),inputs)
+    c = tf.squeeze(c,axis=1)
+    c = tf.contrib.layers.fully_connected(c,hidden_size*mf)
+    return c
 
 
-class PointerNetwork():
-    def __init__(self, value_vec_size, query_vec_size, keep_prob):
+def pointer_util(inputs,mask, state, hidden_size,scope = 'pointer'):
+    with tf.variable_scope(scope):
+        _,N,_ = inputs.get_shape().as_list()
+        state_tiled = tf.tile(tf.expand_dims(state,axis=1),[1,N,1])
+        out1 = tf.contrib.layers.fully_connected(state_tiled,hidden_size,activation_fn = None) + tf.contrib.layers.fully_connected(inputs,hidden_size,activation_fn = None)
+        out1 = tf.tanh(out1)
+        out2 = tf.contrib.layers.fully_connected(out1,1,activation_fn = None)
+        logits, dist = masked_softmax(tf.squeeze(out2,axis = 2),mask,1)
+        c = tf.matmul(tf.expand_dims(dist,axis = 1),inputs)
+        return logits,dist, tf.squeeze(c,axis=1)
+
+class PtrNet():
+    def __init__(self,keep_prob,scope, hidden):
         self.keep_prob = keep_prob
-        self.query_vec_size = query_vec_size
-        self.value_vec_size = value_vec_size
-        self.initializer = tf.contrib.layers.xavier_initializer()
+        self.scope = scope
+        self.GRUCell = tf.contrib.rnn.GRUCell(hidden)
 
-    def build_graph(self, attn_contexts, context_mask, ques, ques_mask):
-        with tf.variable_scope('ptrNetwork'):
-            '''
-            bs,N,d = attn_contexts.get_shape().as_list()
-            _,M,_ = ques.get_shape().as_list()
-            #Defining parameters for the network
-            W_u_q = tf.get_variable("W_u_q", shape = [value_vec_size,value_vec_size], initializer = self.initializer)
-            W_v_q = tf.get_variable("W_v_q", shape = [value_vec_size,value_vec_size], initializer = self.initializer)
-            v = tf.get_variable("v", shape = [d,1], initializer = self.initializer)
-            Vr = tf.get_variable("Vr", shape = [1,d], initializer = self.initializer)
-            
-            # For the initial state
-            ques_flat = tf.reshape(ques,[-1,self.value_vec_size])
-            a1 = tf.matmul(ques_flat, W_u_q)
-
-            tiled_Vr = tf.tile(Vr,[M*bs,1])
-            a2 = tf.matmul(tiled_Vr,W_u_q)
-
-            a = tf.tanh(a1+a2)
-
-            s = tf.matmul(a,v)
-            s = tf.reshape(s,[-1,M])
-
-            _,alpha = masked_softmax(s,ques_mask)
-            alpha = tf.reshape(alpha,[-1,1,M])
-            r = tf.matmul(alpha,ques)
-            r = tf.squeeze(r,axis = [1]) #This will be the hidden state of the pointer network
-            h_prev = r
-            '''
-            bs,N,d = attn_contexts.get_shape().as_list()
-            attn_contexts_flat = tf.reshape(attn_contexts,[-1,1,d])
-            inputs = tf.concat([attn_contexts_flat,attn_contexts_flat],axis = 1)
-            print(inputs.shape)
-            ptr_cell = PointerGRUCell(d,N,context_mask)
-            logits,_ = tf.nn.dynamic_rnn(ptr_cell,inputs,dtype = tf.float32)
-            return logits
-
-
+    def build_graph(self, attn_contexts, context_mask, initial_state, hidden_size):
+        with tf.variable_scope(self.scope):
+            start_logits,start_dist, c = pointer_util(attn_contexts, context_mask, initial_state, hidden_size)
+            print initial_state.shape
+            _,state = self.GRUCell(c,initial_state)
+            tf.get_variable_scope().reuse_variables()
+            end_logits, end_dist,_ = pointer_util(attn_contexts,context_mask,state, hidden_size)
+            return start_logits,start_dist, end_logits, end_dist
 
 
 
@@ -506,6 +495,8 @@ def masked_softmax(logits, mask, dim):
         Should sum to 1 over given dimension.
     """
     exp_mask = (1 - tf.cast(mask, 'float')) * (-1e30) # -large where there's padding, 0 elsewhere
+    print "exp_mask_shape",exp_mask.shape
+    print "logits_shape",logits.shape
     masked_logits = tf.add(logits, exp_mask) # where there's padding, set logits to -large
     prob_dist = tf.nn.softmax(masked_logits, dim)
     return masked_logits, prob_dist

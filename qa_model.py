@@ -146,6 +146,7 @@ class QAModel(object):
 		# Note, blended_reps_final corresponds to b' in the handout
 		# Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
 		blended_reps_final = tf.contrib.layers.fully_connected(blended_reps, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
+		print "Blended reps shape", blended_reps_final.shape
 
 		# Use softmax layer to compute probability distribution for start location
 		# Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
@@ -522,6 +523,52 @@ class QAModel(object):
 
 		sys.stdout.flush()
 
+class QAModelTrans(QAModel):
+	def __init__(self, FLAGS, id2word, word2id, emb_matrix):
+		QAModel.__init__(self, FLAGS, id2word, word2id, emb_matrix)
+
+	def build_graph(self):
+		"""Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
+
+		Defines:
+		  self.logits_start, self.logits_end: Both tensors shape (batch_size, context_len).
+			These are the logits (i.e. values that are fed into the softmax function) for the start and end distribution.
+			Important: these are -large in the pad locations. Necessary for when we feed into the cross entropy function.
+		  self.probdist_start, self.probdist_end: Both shape (batch_size, context_len). Each row sums to 1.
+			These are the result of taking (masked) softmax of logits_start and logits_end.
+		"""
+
+		# Use a RNN to get hidden states for the context and the question
+		# Note: here the RNNEncoder is shared (i.e. the weights are the same)
+		# between the context and the question.
+		encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
+		context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, hidden_size*2)
+		question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, hidden_size*2)
+
+		# Use context hidden states to attend to question hidden states
+		# Use context hidden states to attend to question hidden states
+		attn_layer = ScaledDotAttention(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
+		blended_reps = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*4)
+		# Apply fully connected layer to each blended representation
+		# Note, blended_reps_final corresponds to b' in the handout
+		# Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
+		blended_reps_final = tf.contrib.layers.fully_connected(blended_reps, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
+		print "Blended reps shape", blended_reps_final.shape
+
+		# Use softmax layer to compute probability distribution for start location
+		# Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
+		with vs.variable_scope("StartDist"):
+			softmax_layer_start = SimpleSoftmaxLayer()
+			self.logits_start, self.probdist_start = softmax_layer_start.build_graph(blended_reps_final, self.context_mask)
+
+		# Use softmax layer to compute probability distribution for end location
+		# Note this produces self.logits_end and self.probdist_end, both of which have shape (batch_size, context_len)
+		with vs.variable_scope("EndDist"):
+			softmax_layer_end = SimpleSoftmaxLayer()
+			self.logits_end, self.probdist_end = softmax_layer_end.build_graph(blended_reps_final, self.context_mask)
+
+
+
 class QAModelPtr(QAModel):
 	def __init__(self,FLAGS,id2word,word2id,emb_matrix):
 		QAModel.__init__(self, FLAGS, id2word, word2id, emb_matrix)
@@ -552,15 +599,10 @@ class QAModelPtr(QAModel):
 		blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
 
 		# Applying a pointer network to obtain the starting index and ending index distribution
-		pointer = PointerNetwork(4*self.FLAGS.hidden_size, 2*self.FLAGS.hidden_size, self.keep_prob) 	
-		logits = pointer.build_graph(blended_reps,self.context_mask, question_hiddens,self.qn_mask)
-		self.logits_start, self.logits_end = tf.split(logits, 2, 1)
-		print(self.logits_start.shape)
-		self.logits_start = tf.squeeze(self.logits_start,axis = 1)
-		self.logits_end = tf.squeeze(self.logits_end,axis = 1)
+		initial_state = get_initial_state(question_hiddens, self.qn_mask, self.FLAGS.hidden_size)
+		pointer = PtrNet(self.keep_prob,'PtrNet',4*self.FLAGS.hidden_size) 	
+		self.logits_start,self.probdist_start, self.logits_end, self.probdist_end = pointer.build_graph(blended_reps,self.context_mask, initial_state,self.FLAGS.hidden_size)
 
-		self.logits_start, self.probdist_start = masked_softmax(self.logits_start,self.context_mask,1)
-		self.logits_end,self.probdist_end = masked_softmax(self.logits_end,self.context_mask,1)		
 
 class QAModelCharCNN(QAModel):
 	def __init__(self, FLAGS, id2word, word2id,char2id,id2char, emb_matrix):	
@@ -568,11 +610,15 @@ class QAModelCharCNN(QAModel):
 		self.FLAGS = FLAGS
 		self.id2word = id2word
 		self.word2id = word2id
+
+
+
+
 		self.char2id = char2id
 		self.id2char = id2char
 
 		# Add all parts of the graph
-		with tf.variable_scope("QAModel", initializer=tf.contrib.layers.variance_scaling_initializer(factor=1.0, uniform=True)):
+		with tf.variable_scope("QAModelCharCNN", initializer=tf.contrib.layers.variance_scaling_initializer(factor=1.0, uniform=True)):
 			self.add_placeholders()
 			self.add_embedding_layer(emb_matrix)
 			self.build_graph()
@@ -1007,7 +1053,137 @@ class QAModelCharCNN(QAModel):
 
 		sys.stdout.flush()
 
+class RNet(QAModelCharCNN):
+	def __init__(self, FLAGS, id2word, word2id,char2id,id2char, emb_matrix):
+		QAModelCharCNN.__init__(self, FLAGS, id2word, word2id,char2id,id2char, emb_matrix)
 
+	def build_graph(self):
+		"""Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
+
+		Defines:
+		  self.logits_start, self.logits_end: Both tensors shape (batch_size, context_len).
+			These are the logits (i.e. values that are fed into the softmax function) for the start and end distribution.
+			Important: these are -large in the pad locations. Necessary for when we feed into the cross entropy function.
+		  self.probdist_start, self.probdist_end: Both shape (batch_size, context_len). Each row sums to 1.
+			These are the result of taking (masked) softmax of logits_start and logits_end.
+		"""
+
+		# Use a RNN to get hidden states for the context and the question
+		# Note: here the RNNEncoder is shared (i.e. the weights are the same)
+		# between the context and the question.
+		cnn_encoder = CharCNNEncoder(self.FLAGS.embedding_size,self.FLAGS.num_filters,self.FLAGS.kernel_size,"SAME")
+		char_context_embs = cnn_encoder.build_graph(self.char_context_embs)
+		char_context_embs = tf.squeeze(char_context_embs,axis = [1])
+		print(char_context_embs.shape)		
+		char_context_embs = tf.reshape(char_context_embs,[-1,self.FLAGS.context_len,self.FLAGS.num_filters])
+		
+		char_qn_embs = cnn_encoder.build_graph(self.char_qn_embs)
+		char_qn_embs = tf.squeeze(char_qn_embs,axis = [1])
+		print(char_qn_embs.shape)
+		char_qn_embs = tf.reshape(char_qn_embs,[-1,self.FLAGS.question_len,self.FLAGS.num_filters])
+
+		self.context_embs = tf.concat([self.context_embs,char_context_embs],axis =2)
+		self.qn_embs = tf.concat([self.qn_embs,char_qn_embs],axis = 2)
+
+		encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
+		context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, hidden_size*2)
+		question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, hidden_size*2)
+
+		# Use context hidden states to attend to question hidden states
+		attn_layer = BasicAttn(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
+		_, attn_output = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*2)
+
+		# Concat attn_output to context_hiddens to get blended_reps
+		blended_reps = tf.concat([context_hiddens, attn_output], axis=2) # (batch_size, context_len, hidden_size*4)
+
+		#Applying Self attention to blended_reps
+		self_attn_layer = SelfAttn(self.keep_prob,self.FLAGS.hidden_size*4)
+		self_attn_output = self_attn_layer.build_graph(blended_reps,self.context_mask)
+
+		# Concat self_attn_output to blended_reps to get attn_reps
+		attn_reps = tf.concat([blended_reps,self_attn_output],axis = 2)
+
+		#Feeding attn_reps to a Bidirectional GRU to get h
+		encoder = RNNEncoder(self.FLAGS.hidden_size,self.keep_prob,"RNNEncoder2")
+		h = encoder.build_graph(attn_reps,self.context_mask)
+		
+		# Apply fully connected layer to each blended representation
+		# Note, blended_reps_final corresponds to b' in the handout
+		# Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
+		blended_reps_final = tf.contrib.layers.fully_connected(h, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
+		print "Blended reps shape", blended_reps_final.shape
+		# Use softmax layer to compute probability distribution for start location
+		# Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
+		# Applying a pointer network to obtain the starting index and ending index distribution
+		initial_state = get_initial_state(question_hiddens, self.qn_mask, self.FLAGS.hidden_size,1)
+		pointer = PtrNet(self.keep_prob,'PtrNet',self.FLAGS.hidden_size) 	
+		self.logits_start,self.probdist_start, self.logits_end, self.probdist_end = pointer.build_graph(blended_reps_final
+
+
+			,self.context_mask, initial_state,self.FLAGS.hidden_size)
+
+class RNetTrans(QAModelCharCNN):
+	def __init__(self, FLAGS, id2word, word2id,char2id,id2char, emb_matrix):
+		QAModelCharCNN.__init__(self, FLAGS, id2word, word2id,char2id,id2char, emb_matrix)
+
+	def build_graph(self):
+		"""Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
+
+		Defines:
+		  self.logits_start, self.logits_end: Both tensors shape (batch_size, context_len).
+			These are the logits (i.e. values that are fed into the softmax function) for the start and end distribution.
+			Important: these are -large in the pad locations. Necessary for when we feed into the cross entropy function.
+		  self.probdist_start, self.probdist_end: Both shape (batch_size, context_len). Each row sums to 1.
+			These are the result of taking (masked) softmax of logits_start and logits_end.
+		"""
+
+		# Use a RNN to get hidden states for the context and the question
+		# Note: here the RNNEncoder is shared (i.e. the weights are the same)
+		# between the context and the question.
+		cnn_encoder = CharCNNEncoder(self.FLAGS.embedding_size,self.FLAGS.num_filters,self.FLAGS.kernel_size,"SAME")
+		char_context_embs = cnn_encoder.build_graph(self.char_context_embs)
+		char_context_embs = tf.squeeze(char_context_embs,axis = [1])
+		print(char_context_embs.shape)		
+		char_context_embs = tf.reshape(char_context_embs,[-1,self.FLAGS.context_len,self.FLAGS.num_filters])
+		
+		char_qn_embs = cnn_encoder.build_graph(self.char_qn_embs)
+		char_qn_embs = tf.squeeze(char_qn_embs,axis = [1])
+		print(char_qn_embs.shape)
+		char_qn_embs = tf.reshape(char_qn_embs,[-1,self.FLAGS.question_len,self.FLAGS.num_filters])
+
+		self.context_embs = tf.concat([self.context_embs,char_context_embs],axis =2)
+		self.qn_embs = tf.concat([self.qn_embs,char_qn_embs],axis = 2)
+
+		encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
+		context_hiddens = encoder.build_graph(self.context_embs, self.context_mask) # (batch_size, context_len, hidden_size*2)
+		question_hiddens = encoder.build_graph(self.qn_embs, self.qn_mask) # (batch_size, question_len, hidden_size*2)
+
+		# Use context hidden states to attend to question hidden states
+		attn_layer = ScaledDotAttention(self.keep_prob, self.FLAGS.hidden_size*2, self.FLAGS.hidden_size*2)
+		blended_reps = attn_layer.build_graph(question_hiddens, self.qn_mask, context_hiddens) # attn_output is shape (batch_size, context_len, hidden_size*4)
+
+		#Applying Self attention to blended_reps
+		self_attn_layer = ScaledDotAttention(self.keep_prob, self.FLAGS.hidden_size*4, self.FLAGS.hidden_size*4, scope = "SelfScaledDotAttention")
+		attn_reps = self_attn_layer.build_graph(blended_reps, self.context_mask, blended_reps)
+
+		#Feeding attn_reps to a Bidirectional GRU to get h
+		encoder = RNNEncoder(self.FLAGS.hidden_size,self.keep_prob,"RNNEncoder2")
+		h = encoder.build_graph(attn_reps,self.context_mask)
+		
+		# Apply fully connected layer to each blended representation
+		# Note, blended_reps_final corresponds to b' in the handout
+		# Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
+		blended_reps_final = tf.contrib.layers.fully_connected(h, num_outputs=self.FLAGS.hidden_size) # blended_reps_final is shape (batch_size, context_len, hidden_size)
+		print "Blended reps shape", blended_reps_final.shape
+		# Use softmax layer to compute probability distribution for start location
+		# Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
+		# Applying a pointer network to obtain the starting index and ending index distribution
+		initial_state = get_initial_state(question_hiddens, self.qn_mask, self.FLAGS.hidden_size,1)
+		pointer = PtrNet(self.keep_prob,'PtrNet',self.FLAGS.hidden_size) 	
+		self.logits_start,self.probdist_start, self.logits_end, self.probdist_end = pointer.build_graph(blended_reps_final,self.context_mask, initial_state,self.FLAGS.hidden_size)
+
+
+		
 def write_summary(value, tag, summary_writer, global_step):
 	"""Write a single summary value to tensorboard"""
 	summary = tf.Summary()
